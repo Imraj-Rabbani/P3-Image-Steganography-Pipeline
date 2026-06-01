@@ -1,0 +1,110 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+develop-eggs/
+wheels/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+env.bak/
+venv.bak/
+
+# ---- Testing / coverage ----
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ---- Type checkers / linters ----
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.ruff_cache/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ---- ML model weights & artifacts ----
+*.pth
+!steganalyzer.pth
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.hdf5
+*.pb
+*.tflite
+*.safetensors
+*.joblib
+*.pkl
+*.pickle
+
+# ---- Training checkpoints / outputs (project-specific) ----
+*_checkpoint.json
+filter_checkpoint.json
+sweep_checkpoints/
+finetune_output/
+validation_output/
+runs/
+logs/
+wandb/
+mlruns/
+tensorboard/
+lightning_logs/
+
+# ---- Datasets / generated data (large, regenerable) ----
+filtered_dataset/
+processed_dataset/
+data/
+datasets/
+*.npy
+*.npz
+*.tfrecord
+
+# ---- Generated stego / output images ----
+stego_adaptive.png
+*_stego.png
+output/
+outputs/
+
+# ---- Editors / IDEs ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.spyderproject
+.spyproject
+
+# ---- OS files ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini

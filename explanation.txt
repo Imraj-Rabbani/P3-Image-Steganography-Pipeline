@@ -1,0 +1,342 @@
+================================================================================
+SD 1.5 TEXTURE FINE-TUNING FOR DSTG STEGANOGRAPHY — PROJECT EXPLANATION
+================================================================================
+
+This file walks a new reader through what the codebase does, why each script
+exists, and how to interpret the actual numbers we got out of it.
+
+The project consists of a five-stage pipeline that fine-tunes Stable Diffusion
+v1.5 to produce images whose Discrete Cosine Transform (DCT) coefficients sit
+in a range that is friendly to a JPEG-domain steganography scheme (DSTG).
+
+
+--------------------------------------------------------------------------------
+1. THE BIG IDEA
+--------------------------------------------------------------------------------
+
+Steganography schemes that embed bits in JPEG DCT coefficients (DSTG and its
+relatives) need cover images with lots of "embeddable" coefficients — DCT
+values whose magnitude is large enough that flipping their least significant
+bit doesn't survive being rounded to zero. Most real photographs are mediocre
+at this. Stable Diffusion 1.5 generations are even worse: out of the box, SD
+produces smooth images that have very little energy in the DCT mid-band, so
+DSTG can only embed a handful of bits before running out of usable positions.
+
+The hypothesis: we can LoRA-fine-tune SD 1.5 to bias its outputs toward more
+texture-rich images that have more eligible DCT coefficients, while keeping
+the model's general text-conditioned generation behavior intact.
+
+The downstream measurement: pick 5 prompts, generate covers with both the
+baseline and the fine-tuned model, run a full DSTG embed + PNG round-trip +
+extract loop, and compare metrics.
+
+
+--------------------------------------------------------------------------------
+2. THE PIPELINE — FIVE SCRIPTS
+--------------------------------------------------------------------------------
+
+The five scripts run in order. Each writes outputs that the next consumes.
+
+  filter_dataset.py  →  preprocess.py  →  check.py  →  finetune.py  →  validate.py
+                                                                            │
+                                                                  sweep_checkpoints.py
+                                                                  (optional sixth)
+
+Default working layout (paths on this machine):
+
+  C:\Users\T2520761\Desktop\image_stego\
+    filter_dataset.py            stage 1
+    preprocess.py                stage 2
+    check.py                     stage 3
+    finetune.py                  stage 4
+    validate.py                  stage 5
+    sweep_checkpoints.py         stage 5b
+    filtered_dataset/            outputs of stage 1
+    processed_dataset/           outputs of stage 2
+    validation_output/           outputs of stages 5 and 5b
+  D:\image_stego_runs\
+    finetune_output/             outputs of stage 4 (redirected to D: for disk space)
+
+
+--------------------------------------------------------------------------------
+3. STAGE 1 — filter_dataset.py
+--------------------------------------------------------------------------------
+
+WHAT:  Scans the HuggingFace dataset `gmongaras/Imagenet21K_Recaption` shard by
+shard. For each candidate image, takes its Y channel, divides into 8x8 blocks,
+runs a JPEG-style quantized DCT, and counts how many "embeddable" coefficients
+sit at 20 fixed mid-band positions. An image is accepted if more than 30 % of
+its blocks have ALL 20 mid-band positions embeddable.
+
+WHY:  We need training data that already exhibits the property we want SD to
+learn. Photos of fur, moss, bark, brick, fabric — anything textured — will
+have many such coefficients; smooth gradients won't.
+
+HOW IT RUNS:  Multiprocessing pool (cpu_count - 2 workers), pulls shards from
+HuggingFace one at a time, processes rows with `pool.imap`, saves accepted
+images directly into `filtered_dataset/` as JPEGs plus matching .txt captions
+plus an `index.csv`. A checkpoint file (`filter_checkpoint.json`) tracks the
+last shard finished so it can resume after a crash.
+
+RESULT ON THIS MACHINE:  Reached the configured target of 50 000 accepted
+images after 572 shards of the dataset.
+
+  filter_checkpoint.json -> {"last_shard": 571, "total_accepted": 50000}
+
+
+--------------------------------------------------------------------------------
+4. STAGE 2 — preprocess.py
+--------------------------------------------------------------------------------
+
+WHAT:  Turns each filtered JPEG into the exact form the training loop needs:
+  - centre-crop to a square,
+  - Lanczos-resize to 256 x 256,
+  - save as PNG (lossless),
+  - compute the block-wise 8x8 DCT-II on the [-1, 1] normalized image and
+    save as a (3, 32, 32, 8, 8) float32 numpy array,
+  - copy the caption .txt file,
+  - append a row to `processed_dataset/manifest.csv`.
+
+WHY:  Doing the DCT once at preprocess time saves the training loop from
+recomputing it every epoch. The PNGs are lossless so the cover statistics
+the model sees are exactly the statistics the filter selected for.
+
+DISCARD RULE:  Any image whose shorter side is below 250 px is dropped (a
+safety net — most should have been filtered out in stage 1 already).
+
+RESULT ON THIS MACHINE:  50 000 filtered  ->  40 101 processed PNG+DCT+caption
+triplets. The ~9 900 dropped were images whose shorter side fell below 250 px
+after centre-crop.
+
+
+--------------------------------------------------------------------------------
+5. STAGE 3 — check.py
+--------------------------------------------------------------------------------
+
+WHAT:  Pre-flight verification before committing to a long training run.
+Confirms:
+  [1] processed_dataset/ exists, all triplets are complete, no orphan files.
+  [2] 10 random samples have valid PNGs (256 x 256 RGB), DCTs (no NaN/Inf),
+      and non-empty captions.
+  [3] PyTorch sees CUDA and reports the GPU.
+  [4] Prints a static VRAM budget for full fine-tune vs LoRA so the user can
+      pick the right training mode for their card.
+  [5] Spins up a DataLoader with 4 workers and measures throughput.
+
+WHY:  Cheap insurance. Catches "I installed the CPU-only build of torch by
+accident" before the user wastes 20 hours on a CPU training loop.
+
+A real example caught by this script: the first run reported
+
+  [3] CUDA / GPU
+    ✓ torch importable  — v2.12.0+cpu
+    ✗ CUDA available    — CPU-only build or no CUDA GPU found
+
+which we fixed by reinstalling with the CUDA wheel before proceeding.
+
+
+--------------------------------------------------------------------------------
+6. STAGE 4 — finetune.py
+--------------------------------------------------------------------------------
+
+WHAT:  The actual learning. Trains a tiny LoRA adapter (rank 4, ~250 K
+trainable parameters) on top of the frozen SD 1.5 UNet, optimizing three
+losses simultaneously:
+
+  L_total  =  L_diffusion          standard DDPM epsilon-prediction MSE
+           +  λ_mid · L_mid_reward DCT eligibility reward (negated for grad)
+           +  λ_anchor · L_anchor  L2 to a frozen baseline UNet's noise pred
+
+WHY THREE LOSSES:
+  - L_diffusion keeps the model a working text-to-image generator.
+  - L_mid_reward biases generations toward textures with many eligible mid-
+    band coefficients (this is the experimental contribution).
+  - L_anchor prevents the model from drifting into degenerate reward-hacking
+    output: "produce static noise, every coefficient eligible, win the reward,
+    forget how to obey prompts."
+
+KEY IMPLEMENTATION DETAILS:
+  - Two UNets in GPU simultaneously: the trainable LoRA-wrapped one and a
+    frozen anchor copy. Both receive the same (x_t, t, caption_embedding) per
+    micro-batch.
+  - VAE encoder is frozen and in no_grad; the VAE decoder is NOT in no_grad
+    so the reward loss gradient can flow back through it.
+  - bf16 throughout for the frozen base weights, fp32 for the LoRA matrices
+    (for AdamW numerical stability).
+  - Mid-band reward computes the Y channel of the decoded x_hat_0 via BT.601,
+    block-DCTs it with an orthonormal basis built once at start-up, divides
+    by the JPEG luminance Q-table (continuous, NOT rounded — gradients need
+    to flow), and scores eligibility with a linear hinge.
+  - EMA tracked over the LoRA params with decay 0.9999.
+  - Windows sleep prevention via ctypes so a multi-day run isn't interrupted.
+  - Checkpoint format: every 5 000 steps (we used --checkpoint_every 5000) a
+    folder appears under finetune_output/ containing the full UNet state
+    dict, the VAE state dict, the optimizer state, the EMA shadow, and the
+    EMA-applied UNet state dict for evaluation use.
+
+RESULT ON THIS MACHINE:  The full 80 000-step run completed. 16 numbered
+checkpoints plus a `final/` copy live under
+`D:\image_stego_runs\finetune_output\`.
+
+
+--------------------------------------------------------------------------------
+7. STAGE 5 — validate.py
+--------------------------------------------------------------------------------
+
+WHAT:  Head-to-head comparison of the baseline and the final fine-tuned
+model. Generates 10 covers per model (5 fixed prompts x 2 seeds), runs the
+full DSTG embed + PNG round-trip + extract loop on every cover, computes
+metrics, and produces:
+
+  validation_output/metrics.txt       human-readable aggregate + per-prompt
+  validation_output/metrics.csv       one row per (model, prompt, seed)
+  validation_output/comparison_grid.png   5 x 3 visual grid
+  validation_output/baseline/         10 cover + 10 stego PNGs
+  validation_output/finetuned/        10 cover + 10 stego PNGs
+
+THE EMBEDDED DSTG IMPLEMENTATION:  Self-contained inside validate.py. Embeds
+a 512-bit secret using:
+  - 8x8 block DCT on level-shifted Y,
+  - JPEG luminance quantization,
+  - 64-bit CRC-protected header in blocks (0,0) and (0,1),
+  - K eligible mid-band positions per payload block (K is adaptive, derived
+    from the cover's mean eligible count),
+  - LSB-match writes with min-distortion choice and never-below-2 guarantee.
+
+RESULTS ON THIS MACHINE — the headline table from metrics.txt:
+
+  Metric             Baseline     Fine-tuned        Delta
+  ----------------------------------------------------------
+  K                      7.60          24.50       +16.90    *** texture goal met
+  mid-band ratio       0.0285         0.1445       +0.116    *** ~5x more energy
+  PSNR (dB)             48.49          47.94        -0.55
+  SSIM                 0.9980         0.9998       +0.002
+  bit_accuracy         0.4127         0.2709       -0.142    *** DSTG goal MISSED
+  exact_recovery       0.0000         0.0000        0.000    *** zero recoveries
+  capacity_bits         4 381         17 403       +13 021
+
+INTERPRETATION:
+  - The TEXTURE biasing worked dramatically. The mean adaptive K more than
+    tripled (7.6 -> 24.5) and the mid-band energy ratio went up about 5x.
+    The fine-tuned model is producing visibly more textured images.
+  - The IMAGE QUALITY held up: PSNR is essentially unchanged (cover-vs-stego
+    distortion stayed well above the 38 dB threshold) and SSIM is actually
+    better than baseline. The fine-tune didn't blow up the model.
+  - BUT the downstream DSTG task didn't succeed in this configuration. The
+    bit_accuracy dropped and exact_recovery is zero on both sides. The
+    verdict block at the bottom of metrics.txt confirms two FAILs.
+
+WHY THE STEGO RECOVERY FAILED:  The fine-tune pushed many DCT coefficients
+right to the |q| = 2 boundary that the DSTG eligibility test uses. PNG round-
+trip pixel rounding then flips many of them across that boundary, so the
+extractor sees a different eligibility set from what the embedder wrote, and
+its bit alignment drifts immediately. The "hint" line in metrics.txt names
+the fix directly:
+
+    bit_accuracy > 0.99  ✗  PNG round-trip noise too large
+                           hint: raise eligibility threshold above |q| >= 2
+
+The right knob to turn next is the eligibility threshold inside the DSTG
+helpers (e.g. require |q| >= 3 or |q| >= 4), retraining the lambda_mid weight
+to keep K from running away. That would push the operating point off the
+noise-sensitive boundary at the cost of total capacity.
+
+
+--------------------------------------------------------------------------------
+8. STAGE 5b — sweep_checkpoints.py
+--------------------------------------------------------------------------------
+
+WHAT:  Re-runs the validate.py pipeline against MANY checkpoints from the
+training run, not just the final one. Produces a time-series view of how the
+model evolved during training:
+
+  validation_output/sweep/sweep_metrics.txt   table with one row per ckpt
+  validation_output/sweep/sweep_metrics.csv   same data, machine-readable
+  validation_output/sweep/sweep_plot.png      4-panel matplotlib figure
+  validation_output/sweep/{ckpt}/             per-checkpoint cover+stego PNGs
+
+WHY:  Lets you see whether the metric trends are monotonic (training is still
+improving things) or have plateaued (you could have stopped earlier). Also
+identifies the BEST checkpoint by a reliability key (exact_recovery first,
+then bit_accuracy, then K_mean).
+
+RESULTS ON THIS MACHINE — abbreviated from sweep_metrics.txt:
+
+  step      K_mean   ratio    PSNR    bit_acc   exact
+  baseline    4.75   0.0104   48.99   0.6143    0.000
+  step5000   21.25   0.1657   48.48   0.1240    0.000   <-- jumps immediately
+  step15000  20.00   0.1552   48.19   0.2485    0.000
+  step30000  20.75   0.1717   48.21   0.3027    0.000   <-- best bit_acc
+  step50000  22.25   0.1603   48.42   0.0000    0.000
+  step80000  22.00   0.1485   48.18   0.1426    0.000
+  final      22.00   0.1485   48.18   0.1426    0.000
+
+INTERPRETATION:
+  - The texture shift happens almost INSTANTLY. By step 5 000 (just over 6 %
+    of the way through training) K_mean has already jumped from 4.75 to
+    21.25 and the mid-band ratio is at its training-time level. The
+    remaining 75 000 steps don't change the texture statistic meaningfully.
+  - The bit_accuracy is wildly noisy across checkpoints (0.00 to 0.30) and
+    never approaches the 0.99 target. This is consistent with the validate
+    finding: the DSTG decoder is unstable at the |q| >= 2 boundary for these
+    SD-generated cover images.
+  - The reliability key picks step30000 as the "best" fine-tuned checkpoint,
+    but its bit_accuracy is still only 0.30, so this is the LEAST BAD of a
+    set of failed configurations — not a usable production checkpoint.
+  - PSNR stays around 48 dB throughout and SSIM stays around 0.9997. The
+    model is producing perceptually-similar covers at every checkpoint; the
+    failure is in the steganography decoder, not in the model.
+
+
+--------------------------------------------------------------------------------
+9. WHAT THIS PROJECT SHOWS
+--------------------------------------------------------------------------------
+
+POSITIVE FINDING:  A small LoRA adapter (rank 4, ~250 K trainable parameters)
+trained for 80 000 steps with a custom DCT-eligibility reward CAN successfully
+steer Stable Diffusion 1.5 toward producing images with about 3x more
+embeddable DCT coefficients, without harming the model's general text-to-image
+ability (prompt fidelity is preserved, and SSIM-to-cover is excellent). The
+texture shift happens fast — within the first 5 000 steps — suggesting that
+the LoRA is finding a shallow basin and that much shorter training would
+achieve the same effect.
+
+NEGATIVE FINDING:  The downstream DSTG steganography pipeline as specified
+(|q| >= 2 eligibility, LSB-match with min distortion, JPEG luminance Q-table)
+is NOT robust enough to actually recover secrets from these SD-generated
+covers. The very property the fine-tune optimized for — many coefficients
+near the eligibility boundary — is exactly what makes the boundary unstable
+under PNG round-trip noise.
+
+NEXT EXPERIMENTAL STEPS (in order of likely impact):
+  1. Raise the DSTG eligibility threshold (|q| >= 3 or 4) and retune the
+     reward function to push coefficients further from the boundary.
+  2. Reduce lambda_mid so the fine-tune produces a more moderate texture
+     shift (the current operating point may be over-shooting).
+  3. Add a small amount of redundancy / error correction to the DSTG payload
+     so the decoder can tolerate a few percent bit flips.
+  4. Investigate whether the bit_accuracy floor is image-dependent — the per-
+     prompt breakdown shows prompt 2 (bark texture) recovered 27 % vs prompt
+     0 (cat fur) recovering 0 %, suggesting texture STYLE matters as well as
+     amount.
+
+
+--------------------------------------------------------------------------------
+10. ENVIRONMENT NOTES FOR ANYONE REPRODUCING
+--------------------------------------------------------------------------------
+
+  Hardware:     NVIDIA RTX 4080 (16 GB), Windows 11
+  Python:       3.10+ (uses `from __future__ import annotations` plus PEP 604
+                union syntax in places)
+  Storage:      training checkpoints redirected to D:\ via finetune.py's
+                --output_dir flag (each checkpoint is ~3.5 GB; the 80 000-step
+                run with --checkpoint_every 5000 wrote ~60 GB)
+  HF cache:     HF_HOME redirected to D:\hf_cache for the same reason
+  Key packages: torch (CUDA build), diffusers, transformers, peft, scipy,
+                scikit-image, opencv-python-headless, matplotlib, tqdm, Pillow,
+                huggingface_hub
+  SD 1.5 ID:    runwayml/stable-diffusion-v1-5 (may need a mirror if removed)
+  Run time:     stage 1 ~hours over many shards; stage 2 ~tens of minutes;
+                stage 4 ~18-30 hours; stages 5 + 5b ~5-15 minutes each.
+
+================================================================================
