@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(ls \"c:\\\\Users\\\\T2520761\\\\Desktop\\\\image_stego\\\\\")",
-      "Read(//c/Users/T2520761/Desktop/**)",
-      "PowerShell(nvidia-smi)"
-    ]
-  }
-}

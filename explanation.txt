@@ -26,9 +26,11 @@ The hypothesis: we can LoRA-fine-tune SD 1.5 to bias its outputs toward more
 texture-rich images that have more eligible DCT coefficients, while keeping
 the model's general text-conditioned generation behavior intact.
 
-The downstream measurement: pick 5 prompts, generate covers with both the
-baseline and the fine-tuned model, run a full DSTG embed + PNG round-trip +
-extract loop, and compare metrics.
+The downstream measurement: take a fixed set of texture prompts, generate
+covers with both the baseline and the fine-tuned model (2 seeds per prompt,
+for EVERY prompt), run a full DSTG embed + PNG round-trip + extract loop, and
+compare metrics. Before embedding, the secret is compressed with canonical
+Huffman coding, and decompressed again after extraction.
 
 
 --------------------------------------------------------------------------------
@@ -51,6 +53,8 @@ Default working layout (paths on this machine):
     finetune.py                  stage 4
     validate.py                  stage 5
     sweep_checkpoints.py         stage 5b
+    dct.py                       DSTG engine (Huffman + DCT embed/extract)
+                                 used by validate.py / sweep_checkpoints.py
     filtered_dataset/            outputs of stage 1
     processed_dataset/           outputs of stage 2
     validation_output/           outputs of stages 5 and 5b
@@ -184,26 +188,39 @@ checkpoints plus a `final/` copy live under
 --------------------------------------------------------------------------------
 
 WHAT:  Head-to-head comparison of the baseline and the final fine-tuned
-model. Generates 10 covers per model (5 fixed prompts x 2 seeds), runs the
-full DSTG embed + PNG round-trip + extract loop on every cover, computes
-metrics, and produces:
+model. Generates 2 seeds for EVERY prompt per model (with the 10 prompts in
+validate.py that is 20 covers per model), runs the full DSTG embed + PNG
+round-trip + extract loop on every cover, computes metrics, and produces:
 
   validation_output/metrics.txt       human-readable aggregate + per-prompt
   validation_output/metrics.csv       one row per (model, prompt, seed)
-  validation_output/comparison_grid.png   5 x 3 visual grid
-  validation_output/baseline/         10 cover + 10 stego PNGs
-  validation_output/finetuned/        10 cover + 10 stego PNGs
+  validation_output/comparison_grid.png   one row per prompt, 3 columns
+  validation_output/baseline/         cover + stego PNGs (one pair per cover)
+  validation_output/finetuned/        cover + stego PNGs (one pair per cover)
 
-THE EMBEDDED DSTG IMPLEMENTATION:  Self-contained inside validate.py. Embeds
-a 512-bit secret using:
+THE DSTG ENGINE (dct.py):  validate.py no longer carries its own embedder; it
+delegates to the DCT-domain engine in dct.py via thin dstg_embed/dstg_extract
+wrappers. The engine embeds a secret using:
+  - canonical Huffman compression of the UTF-8 secret BEFORE embedding (and
+    decompression after extraction) — the compressed blob is self-describing
+    (original length + per-symbol code lengths), so no sidecar table is needed,
   - 8x8 block DCT on level-shifted Y,
   - JPEG luminance quantization,
   - 64-bit CRC-protected header in blocks (0,0) and (0,1),
   - K eligible mid-band positions per payload block (K is adaptive, derived
     from the cover's mean eligible count),
-  - LSB-match writes with min-distortion choice and never-below-2 guarantee.
+  - LSB-match writes with min-distortion choice and never-below-2 guarantee,
+  - a verify-fix + exact-Y repair pass so the payload survives the
+    BGR<->YCrCb / PNG round-trip losslessly.
 
-RESULTS ON THIS MACHINE — the headline table from metrics.txt:
+NOTE:  canonical Huffman needs a per-symbol code-length table, which is pure
+overhead for short high-entropy secrets. The 512-bit validation secret is
+random printable ASCII, so it actually EXPANDS slightly under Huffman; natural-
+language secrets compress. Capacity is large enough that either case fits.
+
+RESULTS ON THIS MACHINE — the headline table from metrics.txt (captured from
+the earlier 5-prompt run, before the all-prompts and Huffman changes; rerun
+validate.py to regenerate under the current configuration):
 
   Metric             Baseline     Fine-tuned        Delta
   ----------------------------------------------------------

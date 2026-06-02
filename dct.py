@@ -355,6 +355,107 @@ def _exact_y_repair(cover_bgr: np.ndarray, target_y: np.ndarray, cr: np.ndarray,
     return bgr
 
 
+# ── Canonical Huffman codec (self-contained, no external table needed) ───────
+# The secret message is compressed with canonical Huffman before embedding and
+# decompressed after extraction. The compressed blob is fully self-describing:
+# it carries the original length and the per-symbol code lengths, so the
+# extractor can rebuild the identical canonical code with no sidecar.
+#
+# Blob layout (big-endian):
+#   [0:4]  original byte length L
+#   if L == 0: nothing else follows
+#   [4]    number of distinct symbols - 1   (0..255 -> 1..256 symbols)
+#   then nsym pairs of (symbol_byte, code_length_byte), in canonical order
+#   then the packed Huffman bitstream (MSB-first, zero-padded to a byte)
+def _huff_code_lengths(data: bytes) -> dict:
+    """Per-symbol Huffman code lengths via a weight-ordered binary merge."""
+    import heapq
+    from collections import Counter
+    freq = Counter(data)
+    if len(freq) == 1:
+        # A single distinct symbol still needs one bit per occurrence.
+        return {next(iter(freq)): 1}
+    heap, order = [], 0
+    for sym, f in freq.items():
+        heapq.heappush(heap, (f, order, ('leaf', sym))); order += 1
+    while len(heap) > 1:
+        f1, _, n1 = heapq.heappop(heap)
+        f2, _, n2 = heapq.heappop(heap)
+        heapq.heappush(heap, (f1 + f2, order, ('node', n1, n2))); order += 1
+    lengths = {}
+    stack = [(heap[0][2], 0)]
+    while stack:
+        node, depth = stack.pop()
+        if node[0] == 'leaf':
+            lengths[node[1]] = depth
+        else:
+            stack.append((node[1], depth + 1))
+            stack.append((node[2], depth + 1))
+    return lengths
+
+def _canonical_codes(lengths: dict) -> dict:
+    """Assign canonical codes from code lengths. Returns sym -> (code, length)."""
+    syms = sorted(lengths.keys(), key=lambda s: (lengths[s], s))
+    codes = {}
+    code, prev_len = 0, None
+    for sym in syms:
+        l = lengths[sym]
+        code = 0 if prev_len is None else (code + 1) << (l - prev_len)
+        codes[sym] = (code, l)
+        prev_len = l
+    return codes
+
+def _huff_compress(data: bytes) -> bytes:
+    L = len(data)
+    out = bytearray(L.to_bytes(4, 'big'))
+    if L == 0:
+        return bytes(out)
+    lengths = _huff_code_lengths(data)
+    codes   = _canonical_codes(lengths)
+    syms    = sorted(lengths.keys(), key=lambda s: (lengths[s], s))
+    out.append(len(syms) - 1)
+    for sym in syms:
+        out.append(sym)
+        out.append(lengths[sym])
+    bit_acc, nbits, packed = 0, 0, bytearray()
+    for byte in data:
+        code, l = codes[byte]
+        bit_acc = (bit_acc << l) | code
+        nbits  += l
+        while nbits >= 8:
+            nbits -= 8
+            packed.append((bit_acc >> nbits) & 0xFF)
+    if nbits > 0:
+        packed.append((bit_acc << (8 - nbits)) & 0xFF)
+    out += packed
+    return bytes(out)
+
+def _huff_decompress(blob: bytes) -> bytes:
+    L = int.from_bytes(blob[0:4], 'big')
+    if L == 0:
+        return b''
+    nsym = blob[4] + 1
+    pos, lengths = 5, {}
+    for _ in range(nsym):
+        lengths[blob[pos]] = blob[pos + 1]
+        pos += 2
+    codes  = _canonical_codes(lengths)
+    lookup = {(l, c): sym for sym, (c, l) in codes.items()}
+    stream = blob[pos:]
+    res, codeval, length, bit_index = bytearray(), 0, 0, 0
+    total_bits = len(stream) * 8
+    while len(res) < L and bit_index < total_bits:
+        bit = (stream[bit_index >> 3] >> (7 - (bit_index & 7))) & 1
+        bit_index += 1
+        codeval = (codeval << 1) | bit
+        length += 1
+        sym = lookup.get((length, codeval))
+        if sym is not None:
+            res.append(sym)
+            codeval, length = 0, 0
+    return bytes(res)
+
+
 def get_capacity(cover_bgr: np.ndarray) -> dict:
     Y            = cv2.split(cv2.cvtColor(cover_bgr, cv2.COLOR_BGR2YCrCb))[0]
     blocks, _, _ = _to_blocks(Y)
@@ -379,9 +480,15 @@ def get_capacity(cover_bgr: np.ndarray) -> dict:
 def embed(cover_bgr: np.ndarray, message: str) -> np.ndarray:
     h, w = cover_bgr.shape[:2]
 
-    raw  = message.encode('utf-8')
-    bits = [(b >> (7 - k)) & 1 for b in raw for k in range(8)]
+    raw        = message.encode('utf-8')
+    compressed = _huff_compress(raw)
+    bits = [(b >> (7 - k)) & 1 for b in compressed for k in range(8)]
     n    = len(bits)
+
+    if raw:
+        ratio = len(compressed) / len(raw)
+        print(f"  Huffman  : {len(raw)} -> {len(compressed)} bytes  "
+              f"({ratio:.3f}x, {n} bits embedded)")
 
     Y, Cr, Cb = cv2.split(cv2.cvtColor(cover_bgr, cv2.COLOR_BGR2YCrCb))
 
@@ -490,10 +597,11 @@ def extract(stego_bgr: np.ndarray) -> str:
         for i in range(0, len(bits) - 7, 8)
     )
     try:
-        return byte_arr.decode('utf-8')
-    except UnicodeDecodeError as exc:
+        raw = _huff_decompress(bytes(byte_arr))
+        return raw.decode('utf-8')
+    except (UnicodeDecodeError, IndexError, ValueError) as exc:
         raise ValueError(
-            f"UTF-8 decode failed after extracting {len(bits)} bits.  "
+            f"Huffman/UTF-8 decode failed after extracting {len(bits)} bits.  "
             "Image may have been re-compressed after embedding."
         ) from exc
 

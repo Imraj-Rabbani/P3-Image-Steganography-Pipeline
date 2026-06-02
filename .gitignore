@@ -67,7 +67,6 @@ dmypy.json
 filter_checkpoint.json
 sweep_checkpoints/
 finetune_output/
-validation_output/
 runs/
 logs/
 wandb/

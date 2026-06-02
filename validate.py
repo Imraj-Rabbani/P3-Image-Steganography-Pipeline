@@ -511,11 +511,14 @@ def generate_images(
 # Plan: (prompt_idx, seed) pairs
 # ===========================================================================
 def build_plan(num_images: int, seed_base: int) -> list[tuple[int, int]]:
-    """5 prompts x 2 seeds = 10 covers by default."""
+    """2 seeds for every prompt: len(PROMPTS) prompts x 2 seeds covers.
+
+    `num_images` is ignored for the prompt count — every prompt in PROMPTS is
+    always evaluated with NUM_SEEDS seeds.
+    """
     NUM_SEEDS = 2
-    num_pairs = max(1, min(len(PROMPTS), num_images // NUM_SEEDS))
     pairs: list[tuple[int, int]] = []
-    for i in range(num_pairs):
+    for i in range(len(PROMPTS)):
         for j in range(NUM_SEEDS):
             pairs.append((i, seed_base + 2 * i + j))
     return pairs
@@ -787,7 +790,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--num_images",    type=int, default=10,
-                        help="Total covers per model. Mapped to 5 prompts x (num_images//2) seeds.")
+                        help="Ignored; the plan is always all PROMPTS x 2 seeds.")
     parser.add_argument("--seed",          type=int, default=42)
     parser.add_argument("--finetuned_dir", type=str, default="./finetune_output/final")
     parser.add_argument("--output_dir",    type=str, default="./validation_output")
