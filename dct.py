@@ -648,18 +648,19 @@ if __name__ == '__main__':
     else:
         while True:
             MSG   = input('Secret message: ')
-            n_req = len(MSG.encode('utf-8')) * 8
+            # Gate on the COMPRESSED size — that is what actually gets embedded.
+            n_req = len(_huff_compress(MSG.encode('utf-8'))) * 8
             if n_req <= cap['payload_bits']:
                 break
-            print(f'  [!] Message too large: {len(MSG)} chars ({n_req} bits).')
-            print(f'      Max: ~{cap["approx_chars"]} chars ({cap["payload_bits"]} bits).\n')
+            print(f'  [!] Message too large: {len(MSG)} chars compresses to {n_req} bits.')
+            print(f'      Capacity: {cap["payload_bits"]} bits.\n')
 
-    # Validate size when reading from file
-    n_req = len(MSG.encode('utf-8')) * 8
+    # Validate size when reading from file — again on the compressed size.
+    n_req = len(_huff_compress(MSG.encode('utf-8'))) * 8
     if n_req > cap['payload_bits']:
         raise ValueError(
-            f'Message too large: {len(MSG)} chars ({n_req} bits). '
-            f'Max: ~{cap["approx_chars"]} chars ({cap["payload_bits"]} bits).'
+            f'Message too large: {len(MSG)} chars compresses to {n_req} bits, '
+            f'capacity {cap["payload_bits"]} bits.'
         )
 
     # ── Embed ──────────────────────────────────────────────────────────────
