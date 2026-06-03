@@ -148,7 +148,7 @@ def _build_slot_order(K: int, nr: int, nc: int) -> list:
     slots.sort(key=lambda s: (s[0], s[1], s[2], s[3]))
     return [(i, j, u, v) for (_, _, i, j, u, v) in slots]
 
-def _compute_K(blocks: np.ndarray) -> int:
+def _compute_K(blocks: np.ndarray, verbose: bool = True) -> int:
     nr, nc = blocks.shape[:2]
     counts = [
         sum(1 for u, v in _PAYLOAD_CANDIDATES
@@ -163,7 +163,8 @@ def _compute_K(blocks: np.ndarray) -> int:
         return FALLBACK_K
     extra = mean_val // 2
     K     = max(1, min(MAX_K, mean_val + extra))
-    print(f"  K-stats  : mean={mean_val}  extra={extra}  K={K}  (freqs 1-{K+1})")
+    if verbose:
+        print(f"  K-stats  : mean={mean_val}  extra={extra}  K={K}  (freqs 1-{K+1})")
     return K
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -478,8 +479,6 @@ def get_capacity(cover_bgr: np.ndarray) -> dict:
 
 
 def embed(cover_bgr: np.ndarray, message: str) -> np.ndarray:
-    h, w = cover_bgr.shape[:2]
-
     raw        = message.encode('utf-8')
     compressed = _huff_compress(raw)
     bits = [(b >> (7 - k)) & 1 for b in compressed for k in range(8)]
@@ -493,7 +492,7 @@ def embed(cover_bgr: np.ndarray, message: str) -> np.ndarray:
     Y, Cr, Cb = cv2.split(cv2.cvtColor(cover_bgr, cv2.COLOR_BGR2YCrCb))
 
     blocks, h8, w8 = _to_blocks(Y)
-    K              = _compute_K(blocks)
+    K              = _compute_K(blocks, verbose=False)
     nr, nc         = blocks.shape[:2]
 
     n_payload = sum(
@@ -501,11 +500,6 @@ def embed(cover_bgr: np.ndarray, message: str) -> np.ndarray:
         if (i, j) not in _HEADER_BLOCK_SET
     )
     capacity = n_payload * (K + 1)
-
-    print(f"  Image    : {h}x{w}  |  blocks {nr}x{nc}")
-    print(f"  K        : {K}  (freqs 1-{K+1})  |  ZZ range {ZZ_START}-{ZZ_END}  "
-          f"|  capacity {capacity} bits  ({capacity/(h*w):.4f} BPP  ~{capacity//8} chars)")
-    print(f"  Message  : {len(message)} chars  {n} bits  ({n/(h*w):.4f} BPP)")
 
     if n > capacity:
         raise ValueError(
@@ -612,11 +606,7 @@ def quality_metrics(cover_bgr: np.ndarray, stego_bgr: np.ndarray,
     w = min(cover_bgr.shape[1], stego_bgr.shape[1])
     c, s = cover_bgr[:h, :w], stego_bgr[:h, :w]
 
-    # Colour (3-channel BGR) metrics
-    psnr_color = peak_signal_noise_ratio(c, s, data_range=255)
-    ssim_color = structural_similarity(c, s, data_range=255, channel_axis=2)
-
-    # Luma (Y-channel) metrics — the fair, primary metric for Y embedding
+    # Luma (Y-channel) metrics only — the fair, primary metric for Y embedding
     yc = cv2.split(cv2.cvtColor(c, cv2.COLOR_BGR2YCrCb))[0]
     ys = cv2.split(cv2.cvtColor(s, cv2.COLOR_BGR2YCrCb))[0]
     psnr_luma = peak_signal_noise_ratio(yc, ys, data_range=255)
@@ -627,8 +617,7 @@ def quality_metrics(cover_bgr: np.ndarray, stego_bgr: np.ndarray,
         'ssim'      : ssim_luma,    # primary = luma SSIM
         'psnr_luma' : psnr_luma,
         'ssim_luma' : ssim_luma,
-        'psnr_color': psnr_color,
-        'ssim_color': ssim_color,
+        # BPP is computed over the (compressed) payload bits actually embedded
         'bpp'       : n_payload_bits / (h * w),
     }
 
@@ -679,14 +668,13 @@ if __name__ == '__main__':
     cv2.imwrite(STEGO_PATH, stego)
     print(f'  Saved → {STEGO_PATH}')
 
-    raw   = MSG.encode('utf-8')
-    mbits = [(b >> (7 - k)) & 1 for b in raw for k in range(8)]
-    qm    = quality_metrics(cover, stego, len(mbits))
-    print(f'  PSNR (luma/Y) : {qm["psnr_luma"]:.2f} dB   <- primary metric (Y embedding)')
-    print(f'  PSNR (color)  : {qm["psnr_color"]:.2f} dB   <- 3-channel BGR')
-    print(f'  SSIM (luma/Y) : {qm["ssim_luma"]:.4f}')
-    print(f'  SSIM (color)  : {qm["ssim_color"]:.4f}')
-    print(f'  BPP           : {qm["bpp"]:.4f}')
+    # BPP is measured over the compressed payload that is actually embedded.
+    compressed  = _huff_compress(MSG.encode('utf-8'))
+    n_comp_bits = len(compressed) * 8
+    qm          = quality_metrics(cover, stego, n_comp_bits)
+    print(f'  BPP  : {qm["bpp"]:.4f}')
+    print(f'  PSNR : {qm["psnr_luma"]:.2f} dB')
+    print(f'  SSIM : {qm["ssim_luma"]:.4f}')
 
     # ── Extract in-memory ──────────────────────────────────────────────────
     print('\n═══ EXTRACT (in-memory) ═══')
